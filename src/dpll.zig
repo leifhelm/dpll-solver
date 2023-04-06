@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
 const ArrayList = std.ArrayList;
 const math = std.math;
 
@@ -16,7 +17,7 @@ pub const Literal = struct {
         return Self{ .val = -self.val };
     }
 
-    fn variable(self: Self) Variable {
+    pub fn variable(self: Self) Variable {
         return Variable{
             .val = @intCast(usize, math.absInt(self.val) catch unreachable),
         };
@@ -71,8 +72,12 @@ pub const Variable = struct {
 
     val: usize,
 
-    pub fn fromIndex(index: usize) Self {
-        return Self{ .val = index + 1 };
+    pub fn fromIndex(idx: usize) Self {
+        return Self{ .val = idx + 1 };
+    }
+
+    pub fn index(self: Self) usize {
+        return self.val - 1;
     }
 
     pub fn eql(a: Self, b: Self) bool {
@@ -92,7 +97,13 @@ pub const ConstClause = []const Literal;
 pub const Clause = struct {
     const Self = @This();
 
-    literals: ArrayList(Literal),
+    literals: []Literal,
+
+    pub fn initEmpty(allocator: Allocator, size: usize) error{OutOfMemory}!Self {
+        return Self{
+            .literals = try allocator.alloc(Literal, size),
+        };
+    }
 
     pub fn fromSlice(allocator: Allocator, variables: usize, const_clause: ConstClause) (Error || error{OutOfMemory})!Self {
         if (variables > math.maxInt(isize)) return Error.TooManyVariables;
@@ -103,45 +114,39 @@ pub const Clause = struct {
     }
 
     pub fn fromSliceUnchecked(allocator: Allocator, const_clause: ConstClause) error{OutOfMemory}!Self {
-        var literals = ArrayList(Literal).fromOwnedSlice(allocator, try allocator.dupe(Literal, const_clause));
-        errdefer literals.deinit();
         return Self{
-            .literals = literals,
+            .literals = try allocator.dupe(Literal, const_clause),
         };
     }
 
-    pub fn deinit(self: Self) void {
-        self.literals.deinit();
-    }
-
-    // fn verify(self: Self, variables: usize) Error!void {
-    //     for (self.literals.items) |literal| {
-    //         if (literal > variables) return Error.InvalidInput;
-    //         if (literal < -@intCast(isize, variables)) return Error.InvalidInput;
-    //         if (literal == 0) return Error.InvalidInput;
-    //     }
-    // }
-
     fn unit(self: Self) ?Literal {
-        if (self.literals.items.len == 1) {
-            return self.literals.items[0];
+        if (self.literals.len == 1) {
+            return self.literals[0];
         } else {
             return null;
         }
     }
 
-    fn eliminateLiteral(self: Self, literal: Literal) error{OutOfMemory}!?Self {
+    fn eliminateLiteral(self: Self, literal: Literal, allocator: Allocator) error{OutOfMemory}!?Self {
         std.debug.assert(literal.val != 0);
-        var new = ArrayList(Literal).init(self.literals.allocator);
-        errdefer new.deinit();
-        for (self.literals.items) |other_literal| {
+
+        var size: usize = 0;
+        for (self.literals) |other_literal| {
             if (!literal.isSameVariable(other_literal)) {
-                try new.append(other_literal);
-            } else {
-                if (other_literal.eql(literal)) {
-                    new.deinit();
-                    return null;
-                }
+                size += 1;
+            } else if (other_literal.eql(literal)) {
+                return null;
+            }
+        }
+
+        var new = try allocator.alloc(Literal, size);
+        errdefer allocator.free(new);
+
+        var index: usize = 0;
+        for (self.literals) |other_literal| {
+            if (!literal.isSameVariable(other_literal)) {
+                new[index] = other_literal;
+                index += 1;
             }
         }
         return Self{
@@ -159,6 +164,7 @@ const Step = struct {
     decision_level: usize,
     freely_chosen: bool,
     decision: ?Literal,
+    arena: ArenaAllocator,
 
     pub fn init(constraints: Constraints) Self {
         return Self{
@@ -166,21 +172,17 @@ const Step = struct {
             .decision_level = 0,
             .decision = null,
             .freely_chosen = false,
+            .arena = constraints.arena,
         };
     }
 
     pub fn deinit(self: Self) void {
-        deinitClauses(self.clauses);
-    }
-
-    fn deinitClauses(clauses: ArrayList(Clause)) void {
-        for (clauses.items) |clause| {
-            clause.deinit();
-        }
-        clauses.deinit();
+        self.clauses.deinit();
+        self.arena.deinit();
     }
 
     fn unitPropagation(self: Self) ?Literal {
+        // std.debug.print("unit propagation\n", .{});
         for (self.clauses.items) |clause| {
             if (clause.unit()) |unit| {
                 return unit;
@@ -190,11 +192,12 @@ const Step = struct {
     }
 
     fn pureLiteral(self: Self, pure_literal_state: []LiteralState) ?Literal {
+        // std.debug.print("pure literal\n", .{});
         for (pure_literal_state) |*literal_state| {
             literal_state.* = .None;
         }
         for (self.clauses.items) |clause| {
-            for (clause.literals.items) |literal| {
+            for (clause.literals) |literal| {
                 const literal_state = &pure_literal_state[literal.index()];
                 const new_state = if (literal.isPos()) LiteralState.Pos else LiteralState.Neg;
                 if (literal_state.* == .None) {
@@ -218,18 +221,20 @@ const Step = struct {
     fn isSat(self: Self) ?Result {
         if (self.clauses.items.len == 0) return .Sat;
         for (self.clauses.items) |clause| {
-            if (clause.literals.items.len == 0) return .Unsat;
+            if (clause.literals.len == 0) return .Unsat;
         }
         return null;
     }
 
     fn eliminateLiteral(self: Self, literal: Literal, freely_chosen: bool) error{OutOfMemory}!Self {
-        std.debug.print("eliminate: {}, freely_chosen: {}\n", .{literal, freely_chosen});
+        // std.debug.print("eliminate: {}, freely_chosen: {}\n", .{ literal, freely_chosen });
         var clauses = ArrayList(Clause).init(self.clauses.allocator);
-        errdefer deinitClauses(clauses);
+        errdefer clauses.deinit();
+        var arena = ArenaAllocator.init(self.clauses.allocator);
+        errdefer arena.deinit();
 
         for (self.clauses.items) |clause| {
-            if (try clause.eliminateLiteral(literal)) |new_clause| {
+            if (try clause.eliminateLiteral(literal, arena.allocator())) |new_clause| {
                 try clauses.append(new_clause);
             }
         }
@@ -238,6 +243,7 @@ const Step = struct {
             .decision = literal,
             .decision_level = if (freely_chosen) self.decision_level + 1 else self.decision_level,
             .freely_chosen = freely_chosen,
+            .arena = arena,
         };
     }
 };
@@ -248,11 +254,13 @@ pub const Constraints = struct {
     const Self = @This();
     clauses: ArrayList(Clause),
     variables: usize,
+    arena: ArenaAllocator,
 
     pub fn init(allocator: Allocator) Self {
         return Self{
             .clauses = ArrayList(Clause).init(allocator),
             .variables = 0,
+            .arena = ArenaAllocator.init(allocator),
         };
     }
 
@@ -269,15 +277,12 @@ pub const Constraints = struct {
     }
 
     pub fn deinit(self: Self) void {
-        for (self.clauses.items) |clause| {
-            clause.deinit();
-        }
         self.clauses.deinit();
+        self.arena.deinit();
     }
 
     pub fn add(self: *Self, const_clause: []const Literal) (Error || error{OutOfMemory})!void {
-        const clause = try Clause.fromSlice(self.clauses.allocator, self.variables, const_clause);
-        errdefer clause.deinit();
+        const clause = try Clause.fromSlice(self.arena.allocator(), self.variables, const_clause);
         try self.clauses.append(clause);
     }
 
@@ -287,7 +292,7 @@ pub const Constraints = struct {
 
     pub fn newLiteral(self: *Self) Literal {
         self.variables += 1;
-        return (Variable{.val = self.variables}).pos();
+        return (Variable{ .val = self.variables }).pos();
     }
 };
 
@@ -299,7 +304,7 @@ pub const DpllSolver = struct {
     used_variables: ArrayList(bool),
     pure_literal_state: ArrayList(LiteralState),
 
-    pub fn init(allocator: Allocator, constraints: Constraints) (Error || error{OutOfMemory})!Self {
+    pub fn init(allocator: Allocator, constraints: Constraints) (error{OutOfMemory})!Self {
         errdefer constraints.deinit();
 
         var steps = ArrayList(Step).init(allocator);
@@ -334,24 +339,30 @@ pub const DpllSolver = struct {
         self.used_variables.deinit();
     }
 
-    pub fn solve(self: *Self) error{OutOfMemory}!Result {
+    pub fn solve(self: *Self) error{OutOfMemory}!ModelResult {
         while (self.steps.items.len > 0) {
             const last_step = self.lastStep();
 
-            for(self.steps.items) |step| {
-                if(step.decision) |literal| {
-                    std.debug.print("{} ", .{literal});
-                }
-            }
-            std.debug.print("\n", .{});
-            for (last_step.clauses.items) |clause| {
-                std.debug.print("{any}\n", .{clause.literals.items});
-            }
-            std.debug.print("\n", .{});
+            // std.debug.print("decision level: {}\n", .{last_step.decision_level});
+
+            // for (self.steps.items) |step| {
+            //     if (step.decision) |literal| {
+            // std.debug.print("{} ", .{literal});
+            //     }
+            // }
+            // std.debug.print("\n", .{});
+            // for (last_step.clauses.items) |clause| {
+            // std.debug.print("{any}\n", .{clause.literals.items});
+            // }
+            // std.debug.print("\n", .{});
 
             if (last_step.isSat()) |result| {
                 if (result == .Sat) {
-                    return result;
+                    return .{ .Sat = try Model.fromSteps(
+                        self.steps.allocator,
+                        self.variables,
+                        self.steps.items,
+                    ) };
                 } else if (result == .Unsat and last_step.decision_level == 0) {
                     return .Unsat;
                 }
@@ -406,6 +417,46 @@ pub const DpllSolver = struct {
     }
 };
 
+pub const Model = struct {
+    const Self = @This();
+
+    assignments: ArrayList(bool),
+
+    fn fromSteps(allocator: Allocator, variables: usize, steps: []const Step) error{OutOfMemory}!Self {
+        var assignments = ArrayList(bool).init(allocator);
+        errdefer assignments.deinit();
+        try assignments.appendNTimes(false, variables);
+        for (steps) |step| {
+            if (step.decision) |literal| {
+                assignments.items[literal.index()] = literal.isPos();
+            }
+        }
+        return Self{ .assignments = assignments };
+    }
+
+    pub fn deinit(self: Self) void {
+        self.assignments.deinit();
+    }
+
+    pub fn getAssignment(self: Self, variable: Variable) bool {
+        return self.assignments.items[variable.index()];
+    }
+};
+
+pub const ModelResult = union(Result) {
+    const Self = @This();
+
+    Sat: Model,
+    Unsat,
+
+    pub fn deinit(self: Self) void {
+        switch (self) {
+            .Unsat => {},
+            .Sat => |model| model.deinit(),
+        }
+    }
+};
+
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const test_allocator = std.testing.allocator;
@@ -440,7 +491,9 @@ test "simple sat" {
     });
     var solver = try DpllSolver.init(test_allocator, constraints);
     defer solver.deinit();
-    try expectEqual(Result.Sat, try solver.solve());
+    const model_result = try solver.solve();
+    defer model_result.deinit();
+    try expectEqual(Result.Sat, model_result);
 }
 
 test "simple unsat" {
@@ -466,5 +519,7 @@ test "simple unsat" {
     };
     var solver = try DpllSolver.init(test_allocator, constraints);
     defer solver.deinit();
-    try expectEqual(Result.Unsat, try solver.solve());
+    const model_result = try solver.solve();
+    defer model_result.deinit();
+    try expectEqual(Result.Unsat, model_result);
 }

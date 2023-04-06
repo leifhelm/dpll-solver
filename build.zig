@@ -11,6 +11,10 @@ pub fn build(b: *std.build.Builder) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const mode = b.standardReleaseOptions();
 
+    const lib = b.addStaticLibrary("solver", "src/lib.zig");
+    lib.setBuildMode(mode);
+    lib.install();
+
     const exe = b.addExecutable("dpll", "src/main.zig");
     exe.setTarget(target);
     exe.setBuildMode(mode);
@@ -31,4 +35,11 @@ pub fn build(b: *std.build.Builder) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&exe_tests.step);
+
+    // examples
+    const sudoku = b.addExecutable("sudoku", "examples/sudoku.zig");
+    sudoku.setTarget(target);
+    sudoku.setBuildMode(mode);
+    sudoku.addPackagePath("solver", "src/lib.zig");
+    sudoku.install();
 }
